@@ -1,4 +1,4 @@
-// Copyright 2019 Tamás Gulácsi
+// Copyright 2019, 2020 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -7,22 +7,24 @@ package godror_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 
 	godror "github.com/godror/godror"
-	errors "golang.org/x/xerrors"
 )
 
 func TestQRCN(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(testContext("QRCN"))
 	defer cancel()
-	conn, err := godror.DriverConn(ctx, testDb)
+
+	cx, err := testDb.Conn(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	testDb.Exec("DROP TABLE test_subscr")
-	if _, err = testDb.Exec("CREATE TABLE test_subscr (i NUMBER)"); err != nil {
+	defer cx.Close()
+	cx.ExecContext(ctx, "DROP TABLE test_subscr")
+	if _, err = cx.ExecContext(ctx, "CREATE TABLE test_subscr (i NUMBER)"); err != nil {
 		t.Fatal(err)
 	}
 	defer testDb.Exec("DROP TABLE test_subscr")
@@ -31,6 +33,10 @@ func TestQRCN(t *testing.T) {
 	cb := func(e godror.Event) {
 		t.Log(e)
 		events = append(events, e)
+	}
+	conn, err := godror.DriverConn(ctx, cx)
+	if err != nil {
+		t.Fatal(err)
 	}
 	s, err := conn.NewSubscription("subscr", cb)
 	if err != nil {
@@ -48,16 +54,16 @@ func TestQRCN(t *testing.T) {
 				t.Skip(err.Error())
 			}
 		}
-		t.Fatalf("%+v", err)
+		t.Fatalf("create %+v", err)
 	}
 	defer s.Close()
-	if err := s.Register("SELECT COUNT(0) FROM test_subscr"); err != nil {
+	if err = s.Register("SELECT COUNT(0) FROM test_subscr"); err != nil {
 		t.Fatalf("%+v", err)
 	}
 	qry := "SELECT regid, table_name FROM USER_CHANGE_NOTIFICATION_REGS"
-	rows, err := testDb.Query(qry)
+	rows, err := cx.QueryContext(ctx, qry)
 	if err != nil {
-		t.Fatal(errors.Errorf("%s: %w", qry, err))
+		t.Fatal(fmt.Errorf("%s: %w", qry, err))
 	}
 	t.Log("--- Registrations ---")
 	for rows.Next() {

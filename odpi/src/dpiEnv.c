@@ -17,6 +17,59 @@
 #include "dpiImpl.h"
 
 //-----------------------------------------------------------------------------
+// dpiEnv__getBaseDate() [INTERNAL]
+//   Return the base date (January 1, 1970 UTC) for the specified handle type.
+// OCI doesn't permit mixing and matching types so a separate bae date is
+// required for each of the three timestamp types. If the type has not been
+// populated already it is created.
+//-----------------------------------------------------------------------------
+int dpiEnv__getBaseDate(dpiEnv *env, uint32_t dataType, void **baseDate,
+        dpiError *error)
+{
+    uint32_t descriptorType;
+    char timezoneBuffer[20];
+    size_t timezoneLength;
+    void **storedBaseDate;
+
+    // determine type of descriptor and location of stored base date
+    switch (dataType) {
+        case DPI_ORACLE_TYPE_TIMESTAMP:
+            storedBaseDate = &env->baseDate;
+            descriptorType = DPI_OCI_DTYPE_TIMESTAMP;
+            break;
+        case DPI_ORACLE_TYPE_TIMESTAMP_TZ:
+            storedBaseDate = &env->baseDateTZ;
+            descriptorType = DPI_OCI_DTYPE_TIMESTAMP_TZ;
+            break;
+        case DPI_ORACLE_TYPE_TIMESTAMP_LTZ:
+            storedBaseDate = &env->baseDateLTZ;
+            descriptorType = DPI_OCI_DTYPE_TIMESTAMP_LTZ;
+            break;
+        default:
+            return dpiError__set(error, "get base date",
+                    DPI_ERR_UNHANDLED_DATA_TYPE, dataType);
+    }
+
+    // if a base date has not been stored already, create it
+    if (!*storedBaseDate) {
+        if (dpiOci__descriptorAlloc(env->handle, storedBaseDate,
+                descriptorType, "alloc base date descriptor", error) < 0)
+            return DPI_FAILURE;
+        if (dpiOci__nlsCharSetConvert(env->handle, env->charsetId,
+                timezoneBuffer, sizeof(timezoneBuffer), DPI_CHARSET_ID_ASCII,
+                "+00:00", 6, &timezoneLength, error) < 0)
+            return DPI_FAILURE;
+        if (dpiOci__dateTimeConstruct(env->handle, *storedBaseDate, 1970, 1, 1,
+                0, 0, 0, 0, timezoneBuffer, timezoneLength, error) < 0)
+            return DPI_FAILURE;
+    }
+
+    *baseDate = *storedBaseDate;
+    return DPI_SUCCESS;
+}
+
+
+//-----------------------------------------------------------------------------
 // dpiEnv__free() [INTERNAL]
 //   Free the memory associated with the environment.
 //-----------------------------------------------------------------------------
@@ -73,10 +126,9 @@ int dpiEnv__getEncodingInfo(dpiEnv *env, dpiEncodingInfo *info)
 //-----------------------------------------------------------------------------
 int dpiEnv__init(dpiEnv *env, const dpiContext *context,
         const dpiCommonCreateParams *params, void *externalHandle,
-        dpiError *error)
+        dpiCreateMode createMode, dpiError *error)
 {
-    char timezoneBuffer[20];
-    size_t timezoneLength;
+    int temp;
 
     // store context and version information
     env->context = context;
@@ -118,8 +170,7 @@ int dpiEnv__init(dpiEnv *env, const dpiContext *context,
         }
 
         // create new environment handle
-        if (dpiOci__envNlsCreate(&env->handle,
-                params->createMode | DPI_OCI_OBJECT,
+        if (dpiOci__envNlsCreate(&env->handle, createMode | DPI_OCI_OBJECT,
                 env->charsetId, env->ncharsetId, error) < 0)
             return DPI_FAILURE;
 
@@ -131,7 +182,7 @@ int dpiEnv__init(dpiEnv *env, const dpiContext *context,
     error->env = env;
 
     // if threaded, create mutex for reference counts
-    if (params->createMode & DPI_OCI_THREADED)
+    if (createMode & DPI_OCI_THREADED)
         dpiMutex__initialize(env->mutex);
 
     // determine encodings in use
@@ -153,28 +204,25 @@ int dpiEnv__init(dpiEnv *env, const dpiContext *context,
         env->nmaxBytesPerCharacter = env->maxBytesPerCharacter;
     else env->nmaxBytesPerCharacter = 4;
 
-    // allocate base date descriptor (for converting to/from time_t)
-    if (dpiOci__descriptorAlloc(env->handle, &env->baseDate,
-            DPI_OCI_DTYPE_TIMESTAMP_LTZ, "alloc base date descriptor",
-            error) < 0)
-        return DPI_FAILURE;
-
-    // populate base date with January 1, 1970
-    if (dpiOci__nlsCharSetConvert(env->handle, env->charsetId, timezoneBuffer,
-            sizeof(timezoneBuffer), DPI_CHARSET_ID_ASCII, "+00:00", 6,
-            &timezoneLength, error) < 0)
-        return DPI_FAILURE;
-    if (dpiOci__dateTimeConstruct(env->handle, env->baseDate, 1970, 1, 1, 0, 0,
-            0, 0, timezoneBuffer, timezoneLength, error) < 0)
-        return DPI_FAILURE;
-
     // set whether or not we are threaded
-    if (params->createMode & DPI_MODE_CREATE_THREADED)
+    if (createMode & DPI_MODE_CREATE_THREADED)
         env->threaded = 1;
 
     // set whether or not events mode has been set
-    if (params->createMode & DPI_MODE_CREATE_EVENTS)
+    if (createMode & DPI_MODE_CREATE_EVENTS)
         env->events = 1;
+
+    // enable SODA metadata cache, if applicable
+    if (params->sodaMetadataCache) {
+        if (dpiUtils__checkClientVersionMulti(env->versionInfo, 19, 11, 21, 3,
+                error) < 0)
+            return DPI_FAILURE;
+        temp = 1;
+        if (dpiOci__attrSet(env->handle, DPI_OCI_HTYPE_ENV, &temp, 0,
+                DPI_OCI_ATTR_SODA_METADATA_CACHE, "set SODA metadata cache",
+                error) < 0)
+            return DPI_FAILURE;
+    }
 
     return DPI_SUCCESS;
 }

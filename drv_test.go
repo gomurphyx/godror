@@ -1,4 +1,4 @@
-// Copyright 2017 Tamás Gulácsi
+// Copyright 2017, 2020 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -7,15 +7,45 @@ package godror
 
 import (
 	"encoding/json"
+	"errors"
+	"os"
+	"strconv"
 	"testing"
 )
 
+func TestNewDriverSepContext(t *testing.T) {
+	if oneContext {
+		if ok, _ := strconv.ParseBool(os.Getenv("GODROR_SEPARATE_CONTEXT")); !ok {
+			t.Skip("GODROR_SEPARATE_CONTEXT is not set, skipping TestNewDriverSepContext")
+		}
+	}
+	for i := 0; i < 10; i++ {
+		t.Log("i:", i)
+		d := &drv{}
+		if cx, err := d.Open("tiger/scott"); err == nil {
+			cx.Close()
+		}
+		defer d.Close()
+	}
+}
+
+func TestNewDriver(t *testing.T) {
+	for i := 0; i < 10; i++ {
+		drv := NewDriver()
+		if cx, err := drv.Open("tiger/scott"); err == nil {
+			cx.Close()
+		}
+		defer drv.Close()
+	}
+}
+
 func TestFromErrorInfo(t *testing.T) {
 	errInfo := newErrorInfo(0, "ORA-24315: érvénytelen attribútumtípus\n")
-	t.Log("errInfo", errInfo)
-	oe := fromErrorInfo(errInfo)
-	t.Log("OraErr", oe)
-	if oe.Code() != 24315 {
+	t.Logf("errInfo: %#v", errInfo)
+	err := fromErrorInfo(errInfo)
+	t.Log("OraErr", err)
+	var oe interface{ Code() int }
+	if !errors.As(err, &oe) || oe.Code() != 24315 {
 		t.Errorf("got %d, wanted 24315", oe.Code())
 	}
 }

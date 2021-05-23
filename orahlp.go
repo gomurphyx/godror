@@ -1,4 +1,4 @@
-// Copyright 2017 Tamás Gulácsi
+// Copyright 2017, 2020 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -11,14 +11,13 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"strconv"
 	"sync"
 	"time"
-
-	errors "golang.org/x/xerrors"
 )
 
 // Number as string
@@ -57,12 +56,12 @@ func (intType) ConvertValue(v interface{}) (driver.Value, error) {
 		return int64(x), nil
 	case float32:
 		if _, f := math.Modf(float64(x)); f != 0 {
-			return int64(x), errors.Errorf("non-zero fractional part: %f", f)
+			return int64(x), fmt.Errorf("non-zero fractional part: %f", f)
 		}
 		return int64(x), nil
 	case float64:
 		if _, f := math.Modf(x); f != 0 {
-			return int64(x), errors.Errorf("non-zero fractional part: %f", f)
+			return int64(x), fmt.Errorf("non-zero fractional part: %f", f)
 		}
 		return int64(x), nil
 	case string:
@@ -75,8 +74,13 @@ func (intType) ConvertValue(v interface{}) (driver.Value, error) {
 			return 0, nil
 		}
 		return strconv.ParseInt(string(x), 10, 64)
+	case *Number:
+		if x == nil || *x == "" {
+			return 0, nil
+		}
+		return strconv.ParseInt(string(*x), 10, 64)
 	default:
-		return nil, errors.Errorf("unknown type %T", v)
+		return nil, fmt.Errorf("unknown type %T", v)
 	}
 }
 
@@ -116,8 +120,13 @@ func (floatType) ConvertValue(v interface{}) (driver.Value, error) {
 			return 0, nil
 		}
 		return strconv.ParseFloat(string(x), 64)
+	case *Number:
+		if x == nil || *x == "" {
+			return 0, nil
+		}
+		return strconv.ParseFloat(string(*x), 64)
 	default:
-		return nil, errors.Errorf("unknown type %T", v)
+		return nil, fmt.Errorf("unknown type %T", v)
 	}
 }
 
@@ -139,12 +148,17 @@ func (numType) ConvertValue(v interface{}) (driver.Value, error) {
 			return 0, nil
 		}
 		return string(x), nil
+	case *Number:
+		if x == nil || *x == "" {
+			return 0, nil
+		}
+		return string(*x), nil
 	case int8, int16, int32, int64, uint16, uint32, uint64:
 		return fmt.Sprintf("%d", x), nil
 	case float32, float64:
 		return fmt.Sprintf("%f", x), nil
 	default:
-		return nil, errors.Errorf("unknown type %T", v)
+		return nil, fmt.Errorf("unknown type %T", v)
 	}
 }
 func (n Number) String() string { return string(n) }
@@ -165,21 +179,36 @@ func (n *Number) Scan(v interface{}) error {
 		*n = Number(x)
 	case Number:
 		*n = x
+	case *Number:
+		if x == nil {
+			*n = ""
+		} else {
+			*n = *x
+		}
 	case int8, int16, int32, int64, uint16, uint32, uint64:
 		*n = Number(fmt.Sprintf("%d", x))
 	case float32, float64:
 		*n = Number(fmt.Sprintf("%f", x))
 	default:
-		return errors.Errorf("unknown type %T", v)
+		return fmt.Errorf("unknown type %T", v)
 	}
 	return nil
 }
 
 // MarshalText marshals a Number to text.
-func (n Number) MarshalText() ([]byte, error) { return []byte(n), nil }
+func (n Number) MarshalText() ([]byte, error) {
+	if len(n) > 40 {
+		return nil, nil
+	}
+	return []byte(n), nil
+}
 
 // UnmarshalText parses text into a Number.
 func (n *Number) UnmarshalText(p []byte) error {
+	*n = ""
+	if len(p) == 0 || len(p) > 40 {
+		return nil
+	}
 	var dotNum int
 	for i, c := range p {
 		if !(c == '-' && i == 0 || '0' <= c && c <= '9') {
@@ -189,7 +218,7 @@ func (n *Number) UnmarshalText(p []byte) error {
 					continue
 				}
 			}
-			return errors.Errorf("unknown char %c in %q", c, p)
+			return fmt.Errorf("unknown char %c in %q", c, p)
 		}
 	}
 	*n = Number(p)
@@ -198,18 +227,16 @@ func (n *Number) UnmarshalText(p []byte) error {
 
 // MarshalJSON marshals a Number into a JSON string.
 func (n Number) MarshalJSON() ([]byte, error) {
-	b, err := n.MarshalText()
-	b2 := make([]byte, 1, 1+len(b)+1)
-	b2[0] = '"'
-	b2 = append(b2, b...)
-	b2 = append(b2, '"')
-	return b2, err
+	if len(n) > 40 {
+		return []byte("null"), nil
+	}
+	return append(append(append(make([]byte, 0, 1+len(n)+1), '"'), []byte(n)...), '"'), nil
 }
 
 // UnmarshalJSON parses a JSON string into the Number.
 func (n *Number) UnmarshalJSON(p []byte) error {
 	*n = Number("")
-	if len(p) == 0 {
+	if len(p) == 0 || len(p) > 40 {
 		return nil
 	}
 	if len(p) > 2 && p[0] == '"' && p[len(p)-1] == '"' {
@@ -242,37 +269,35 @@ type Querier interface {
 // This can help using unknown-at-compile-time, a.k.a.
 // dynamic queries.
 func DescribeQuery(ctx context.Context, db Execer, qry string) ([]QueryColumn, error) {
-	c, err := getConn(ctx, db)
-	if err != nil {
-		return nil, err
-	}
-	defer c.close(false)
-
-	stmt, err := c.PrepareContext(ctx, qry)
-	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
-	st := stmt.(*statement)
-	describeOnly(&st.stmtOptions)
-	dR, err := st.QueryContext(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer dR.Close()
-	r := dR.(*rows)
-	cols := make([]QueryColumn, len(r.columns))
-	for i, col := range r.columns {
-		cols[i] = QueryColumn{
-			Name:      col.Name,
-			Type:      int(col.OracleType),
-			Length:    int(col.Size),
-			Precision: int(col.Precision),
-			Scale:     int(col.Scale),
-			Nullable:  col.Nullable,
+	var cols []QueryColumn
+	err := Raw(ctx, db, func(c Conn) error {
+		stmt, err := c.PrepareContext(ctx, qry)
+		if err != nil {
+			return err
 		}
-	}
-	return cols, nil
+		defer stmt.Close()
+		st := stmt.(*statement)
+		describeOnly(&st.stmtOptions)
+		dR, err := st.QueryContext(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer dR.Close()
+		r := dR.(*rows)
+		cols = make([]QueryColumn, len(r.columns))
+		for i, col := range r.columns {
+			cols[i] = QueryColumn{
+				Name:      col.Name,
+				Type:      int(col.OracleType),
+				Length:    int(col.Size),
+				Precision: int(col.Precision),
+				Scale:     int(col.Scale),
+				Nullable:  col.Nullable,
+			}
+		}
+		return nil
+	})
+	return cols, err
 }
 
 // CompileError represents a compile-time error as in user_errors view.
@@ -292,21 +317,18 @@ func (ce CompileError) Error() string {
 		prefix, ce.Owner, ce.Name, ce.Type, ce.Line, ce.Position, ce.Code, ce.Text)
 }
 
-type queryer interface {
-	Query(string, ...interface{}) (*sql.Rows, error)
-}
-
 // GetCompileErrors returns the slice of the errors in user_errors.
 //
 // If all is false, only errors are returned; otherwise, warnings, too.
-func GetCompileErrors(queryer queryer, all bool) ([]CompileError, error) {
-	rows, err := queryer.Query(`
+func GetCompileErrors(ctx context.Context, queryer Querier, all bool) ([]CompileError, error) {
+	rows, err := queryer.QueryContext(ctx, `
 	SELECT USER owner, name, type, line, position, message_number, text, attribute
 		FROM user_errors
 		ORDER BY name, sequence`)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var errors []CompileError
 	var warn string
 	for rows.Next() {
@@ -405,7 +427,7 @@ func EnableDbmsOutput(ctx context.Context, conn Execer) error {
 	qry := "BEGIN DBMS_OUTPUT.enable(NULL); END;"
 	_, err := conn.ExecContext(ctx, qry)
 	if err != nil {
-		return errors.Errorf("%s: %w", qry, err)
+		return fmt.Errorf("%s: %w", qry, err)
 	}
 	return nil
 }
@@ -420,8 +442,9 @@ func ReadDbmsOutput(ctx context.Context, w io.Writer, conn preparer) error {
 	const qry = `BEGIN DBMS_OUTPUT.get_lines(:1, :2); END;`
 	stmt, err := conn.PrepareContext(ctx, qry)
 	if err != nil {
-		return errors.Errorf("%s: %w", qry, err)
+		return fmt.Errorf("%s: %w", qry, err)
 	}
+	defer stmt.Close()
 
 	lines := make([]string, maxNumLines)
 	var numLines int64
@@ -433,7 +456,10 @@ func ReadDbmsOutput(ctx context.Context, w io.Writer, conn preparer) error {
 		numLines = int64(len(lines))
 		if _, err = stmt.ExecContext(ctx, params...); err != nil {
 			_ = bw.Flush()
-			return errors.Errorf("%s: %w", qry, err)
+			return fmt.Errorf("%s: %w", qry, err)
+		}
+		if numLines == 0 {
+			continue
 		}
 		for i := 0; i < int(numLines); i++ {
 			_, _ = bw.WriteString(lines[i])
@@ -449,21 +475,21 @@ func ReadDbmsOutput(ctx context.Context, w io.Writer, conn preparer) error {
 }
 
 // ClientVersion returns the VersionInfo from the DB.
-func ClientVersion(ctx context.Context, ex Execer) (VersionInfo, error) {
-	c, err := getConn(ctx, ex)
-	if err != nil {
-		return VersionInfo{}, err
-	}
-	return c.drv.ClientVersion()
+func ClientVersion(ctx context.Context, ex Execer) (vi VersionInfo, err error) {
+	err = Raw(ctx, ex, func(c Conn) error {
+		vi, err = c.ClientVersion()
+		return err
+	})
+	return vi, err
 }
 
 // ServerVersion returns the VersionInfo of the client.
-func ServerVersion(ctx context.Context, ex Execer) (VersionInfo, error) {
-	c, err := getConn(ctx, ex)
-	if err != nil {
-		return VersionInfo{}, err
-	}
-	return c.Server, nil
+func ServerVersion(ctx context.Context, ex Execer) (vi VersionInfo, err error) {
+	err = Raw(ctx, ex, func(c Conn) error {
+		vi, err = c.ServerVersion()
+		return err
+	})
+	return vi, err
 }
 
 // Conn is the interface for a connection, to be returned by DriverConn.
@@ -478,30 +504,14 @@ type Conn interface {
 	Rollback() error
 	ClientVersion() (VersionInfo, error)
 	ServerVersion() (VersionInfo, error)
-	GetObjectType(name string) (ObjectType, error)
-	NewSubscription(string, func(Event)) (*Subscription, error)
+	GetObjectType(name string) (*ObjectType, error)
+	NewSubscription(string, func(Event), ...SubscriptionOption) (*Subscription, error)
 	Startup(StartupMode) error
 	Shutdown(ShutdownMode) error
 	NewData(baseType interface{}, SliceLen, BufSize int) ([]*Data, error)
 
 	Timezone() *time.Location
-}
-
-// DriverConn returns the *godror.conn of the database/sql.Conn
-func DriverConn(ctx context.Context, ex Execer) (Conn, error) {
-	return getConn(ctx, ex)
-}
-
-var getConnMu sync.Mutex
-
-func getConn(ctx context.Context, ex Execer) (*conn, error) {
-	getConnMu.Lock()
-	defer getConnMu.Unlock()
-	var c interface{}
-	if _, err := ex.ExecContext(ctx, getConnection, sql.Out{Dest: &c}); err != nil {
-		return nil, errors.Errorf("getConnection: %w", err)
-	}
-	return c.(*conn), nil
+	GetPoolStats() (PoolStats, error)
 }
 
 // WrapRows transforms a driver.Rows into an *sql.Rows.
@@ -509,10 +519,73 @@ func WrapRows(ctx context.Context, q Querier, rset driver.Rows) (*sql.Rows, erro
 	return q.QueryContext(ctx, wrapResultset, rset)
 }
 
-func Timezone(ctx context.Context, ex Execer) (*time.Location, error) {
-	c, err := getConn(ctx, ex)
-	if err != nil {
-		return nil, err
+// Timezone returns the timezone of the connection (database).
+func Timezone(ctx context.Context, ex Execer) (loc *time.Location, err error) {
+	err = Raw(ctx, ex, func(c Conn) error { loc = c.Timezone(); return nil })
+	return loc, err
+}
+
+// DriverConn will return the connection of ex.
+// For connection pools (*sql.DB) this may be a new connection.
+func DriverConn(ctx context.Context, ex Execer) (Conn, error) {
+	return getConn(ctx, ex)
+}
+
+var getConnMu sync.Mutex
+
+// getConn will acquire a separate connection to the same DB as what ex is connected to.
+func getConn(ctx context.Context, ex Execer) (*conn, error) {
+	getConnMu.Lock()
+	defer getConnMu.Unlock()
+	var c interface{}
+	if _, err := ex.ExecContext(ctx, getConnection, sql.Out{Dest: &c}); err != nil {
+		return nil, fmt.Errorf("getConnection: %w", err)
+	} else if c == nil {
+		return nil, errors.New("nil connection")
 	}
-	return c.Timezone(), nil
+	return c.(*conn), nil
+}
+
+// Raw executes f on the given *sql.DB or *sql.Conn.
+func Raw(ctx context.Context, ex Execer, f func(driverConn Conn) error) error {
+	sf := func(driverConn interface{}) error { return f(driverConn.(Conn)) }
+	if rawer, ok := ex.(interface {
+		Raw(func(interface{}) error) error
+	}); ok {
+		return rawer.Raw(sf)
+	}
+	var err error
+	if conner, ok := ex.(interface {
+		Conn(context.Context) (*sql.Conn, error)
+	}); ok {
+		conn, cErr := conner.Conn(ctx)
+		if cErr != nil {
+			return cErr
+		}
+		defer conn.Close()
+		return conn.Raw(sf)
+	}
+	if txer, ok := ex.(interface {
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+	}); ok {
+		tx, txErr := txer.BeginTx(ctx, nil)
+		if txErr != nil {
+			return txErr
+		}
+		defer func() {
+			if err != nil {
+				tx.Rollback()
+			} else {
+				err = tx.Commit()
+			}
+		}()
+		ex = tx
+	}
+
+	var cx *conn
+	if cx, err = getConn(ctx, ex); err != nil {
+		return err
+	}
+	defer cx.Close()
+	return f(cx)
 }

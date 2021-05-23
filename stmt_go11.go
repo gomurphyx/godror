@@ -1,6 +1,6 @@
 // +build !go1.13
 
-// Copyright 2020 Tamás Gulácsi
+// Copyright 2020 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -48,3 +48,5 @@ func (n NullTime) Value() (driver.Value, error) {
 	}
 	return n.Time, nil
 }
+
+var nullTime interface{} = time.Time{}

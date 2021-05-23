@@ -1,4 +1,4 @@
-// Copyright 2017 Tamás Gulácsi
+// Copyright 2017, 2020 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -16,13 +16,65 @@ void CallbackSubscrDebug(void *context, dpiSubscrMessage *message);
 import "C"
 
 import (
+	"errors"
+	"fmt"
 	"log"
+	"runtime"
 	"strings"
 	"sync"
 	"unsafe"
-
-	errors "golang.org/x/xerrors"
 )
+
+// SubscriptionOption is for setting various parameters of the Subscription.
+type SubscriptionOption func(*subscriptionParams)
+
+// SubscrHostPort is a SubscriptionOption that sets tha IPAddress and Port to the specified values.
+//
+// The address is on which the subscription listens to receive notifications,
+// for a server-initiated connection.
+//
+// The address can be an IPv4 address in dotted decimal format such as 192.1.2.34
+// or an IPv6 address in hexadecimal format such as 2001:0db8:0000:0000:0217:f2ff:fe4b:4ced.
+//
+// By default (address is the empty string), an IP address will be selected by the Oracle client.
+//
+// The port number on which to receive notifications, for a server-initiated connection.
+//
+// The default value of 0 means that a port number will be selected by the Oracle client.
+func SubscrHostPort(address string, port uint32) SubscriptionOption {
+	return func(p *subscriptionParams) {
+		p.IPAddress, p.Port = address, port
+	}
+}
+
+// SubscrClientInitiated sets whether the subscription is client-initated.
+func SubscrClientInitiated(b bool) SubscriptionOption {
+	return func(p *subscriptionParams) {
+		p.ClientInitiated = b
+	}
+}
+
+// subscrParams are parameters for a new Subscription.
+type subscriptionParams struct {
+	// IPAddress on which the subscription listens to receive notifications,
+	// for a server-initiated connection.
+	//
+	// The IP address can be an IPv4 address in dotted decimal format such as 192.1.2.34
+	// or an IPv6 address in hexadecimal format such as 2001:0db8:0000:0000:0217:f2ff:fe4b:4ced.
+	//
+	// By default, an IP address will be selected by the Oracle client.
+	IPAddress string
+
+	// Port number on which to receive notifications, for a server-initiated connection.
+	// The default value of 0 means that a port number will be selected by the Oracle client.
+	Port uint32
+
+	// ClientInitiated specifies whether a client or a server initiated connection should be created.
+	//
+	// This feature is only available when Oracle Client 19.4
+	// and Oracle Database 19.4 or higher are being used.
+	ClientInitiated bool
+}
 
 // Cannot pass *Subscription to C, so pass an uint64 that points to this map entry
 var (
@@ -102,10 +154,10 @@ func CallbackSubscr(ctx unsafe.Pointer, message *C.dpiSubscrMessage) {
 
 // Event for a subscription.
 type Event struct {
+	Err     error
+	DB      string
 	Tables  []TableEvent
 	Queries []QueryEvent
-	DB      string
-	Err     error
 	Type    EventType
 }
 
@@ -118,8 +170,8 @@ type QueryEvent struct {
 
 // TableEvent is for a Table-related event.
 type TableEvent struct {
-	Rows []RowEvent
 	Name string
+	Rows []RowEvent
 	Operation
 }
 
@@ -137,28 +189,50 @@ type Subscription struct {
 	ID        uint64
 }
 
-func (s *Subscription) getError() error { return s.conn.getError() }
-
 // NewSubscription creates a new Subscription in the DB.
 //
 // Make sure your user has CHANGE NOTIFICATION privilege!
 //
 // This code is EXPERIMENTAL yet!
-func (c *conn) NewSubscription(name string, cb func(Event)) (*Subscription, error) {
-	if !c.connParams.EnableEvents {
+func (c *conn) NewSubscription(name string, cb func(Event), options ...SubscriptionOption) (*Subscription, error) {
+	if !c.params.EnableEvents {
 		return nil, errors.New("subscription must be allowed by specifying \"enableEvents=1\" in the connection parameters")
+	}
+	var p subscriptionParams
+	for _, o := range options {
+		o(&p)
 	}
 	subscr := Subscription{conn: c, callback: cb}
 	params := (*C.dpiSubscrCreateParams)(C.malloc(C.sizeof_dpiSubscrCreateParams))
-	//defer func() { C.free(unsafe.Pointer(params)) }()
+	defer func() { C.free(unsafe.Pointer(params)) }()
 	C.dpiContext_initSubscrCreateParams(c.drv.dpiContext, params)
 	params.subscrNamespace = C.DPI_SUBSCR_NAMESPACE_DBCHANGE
 	params.protocol = C.DPI_SUBSCR_PROTO_CALLBACK
 	params.qos = C.DPI_SUBSCR_QOS_BEST_EFFORT | C.DPI_SUBSCR_QOS_QUERY | C.DPI_SUBSCR_QOS_ROWIDS
 	params.operations = C.DPI_OPCODE_ALL_OPS
-	if name != "" {
-		params.name = C.CString(name)
-		params.nameLength = C.uint32_t(len(name))
+	if name != "" || p.IPAddress != "" {
+		if name != "" {
+			params.name = C.CString(name)
+			params.nameLength = C.uint32_t(len(name))
+		}
+		if p.IPAddress != "" {
+			params.ipAddress = C.CString(p.IPAddress)
+			params.ipAddressLength = C.uint32_t(len(p.IPAddress))
+		}
+		defer func() {
+			if params.name != nil {
+				C.free(unsafe.Pointer(params.name))
+			}
+			if params.ipAddress != nil {
+				C.free(unsafe.Pointer(params.ipAddress))
+			}
+		}()
+	}
+	if p.Port != 0 {
+		params.portNumber = C.uint32_t(p.Port)
+	}
+	if p.ClientInitiated {
+		params.clientInitiated = C.int(1)
 	}
 	// typedef void (*dpiSubscrCallback)(void* context, dpiSubscrMessage *message);
 	params.callback = C.dpiSubscrCallback(C.CallbackSubscrDebug)
@@ -174,15 +248,13 @@ func (c *conn) NewSubscription(name string, cb func(Event)) (*Subscription, erro
 
 	dpiSubscr := (*C.dpiSubscr)(C.malloc(C.sizeof_void))
 
-	if C.dpiConn_subscribe(c.dpiConn,
-		params,
-		(**C.dpiSubscr)(unsafe.Pointer(&dpiSubscr)),
-	) == C.DPI_FAILURE {
-		C.free(unsafe.Pointer(params))
+	if err := c.checkExec(func() C.int {
+		return C.dpiConn_subscribe(c.dpiConn, params, (**C.dpiSubscr)(unsafe.Pointer(&dpiSubscr)))
+	}); err != nil {
 		C.free(unsafe.Pointer(dpiSubscr))
-		err := errors.Errorf("newSubscription: %w", c.getError())
+		err = fmt.Errorf("newSubscription: %w", err)
 		if strings.Contains(errors.Unwrap(err).Error(), "DPI-1065:") {
-			err = errors.Errorf("specify \"enableEvents=1\" connection parameter on connection to be able to use subscriptions: %w", err)
+			err = fmt.Errorf("specify \"enableEvents=1\" connection parameter on connection to be able to use subscriptions: %w", err)
 		}
 		return nil, err
 	}
@@ -194,23 +266,26 @@ func (c *conn) NewSubscription(name string, cb func(Event)) (*Subscription, erro
 //
 // This code is EXPERIMENTAL yet!
 func (s *Subscription) Register(qry string, params ...interface{}) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	cQry := C.CString(qry)
 	defer func() { C.free(unsafe.Pointer(cQry)) }()
 
 	var dpiStmt *C.dpiStmt
 	if C.dpiSubscr_prepareStmt(s.dpiSubscr, cQry, C.uint32_t(len(qry)), &dpiStmt) == C.DPI_FAILURE {
-		return errors.Errorf("prepareStmt[%p]: %w", s.dpiSubscr, s.getError())
+		return fmt.Errorf("prepareStmt[%p]: %w", s.dpiSubscr, s.conn.getError())
 	}
 	defer func() { C.dpiStmt_release(dpiStmt) }()
 
 	mode := C.dpiExecMode(C.DPI_MODE_EXEC_DEFAULT)
 	var qCols C.uint32_t
 	if C.dpiStmt_execute(dpiStmt, mode, &qCols) == C.DPI_FAILURE {
-		return errors.Errorf("executeStmt: %w", s.getError())
+		return fmt.Errorf("executeStmt: %w", s.conn.getError())
 	}
 	var queryID C.uint64_t
 	if C.dpiStmt_getSubscrQueryId(dpiStmt, &queryID) == C.DPI_FAILURE {
-		return errors.Errorf("getSubscrQueryId: %w", s.getError())
+		return fmt.Errorf("getSubscrQueryId: %w", s.conn.getError())
 	}
 	if Log != nil {
 		Log("msg", "subscribed", "query", qry, "id", queryID)
@@ -234,8 +309,8 @@ func (s *Subscription) Close() error {
 	if dpiSubscr == nil || conn == nil || conn.dpiConn == nil {
 		return nil
 	}
-	if C.dpiConn_unsubscribe(conn.dpiConn, dpiSubscr) == C.DPI_FAILURE {
-		return errors.Errorf("close: %w", s.getError())
+	if err := conn.checkExec(func() C.int { return C.dpiConn_unsubscribe(conn.dpiConn, dpiSubscr) }); err != nil {
+		return fmt.Errorf("close: %w", err)
 	}
 	return nil
 }

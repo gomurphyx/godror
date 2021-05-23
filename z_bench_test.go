@@ -1,4 +1,4 @@
-// Copyright 2017 Tamás Gulácsi
+// Copyright 2017, 2020 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -15,7 +15,6 @@ import (
 	"time"
 
 	godror "github.com/godror/godror"
-	errors "golang.org/x/xerrors"
 )
 
 // go install && go test -c && ./godror.v2.test -test.run=^$ -test.bench=Insert25 -test.cpuprofile=/tmp/insert25.prof && go tool pprof ./godror.v2.test /tmp/insert25.prof
@@ -81,7 +80,7 @@ END tst_bench_25;`,
 			if strings.HasPrefix(qry, "DROP TABLE ") {
 				continue
 			}
-			b.Fatal(errors.Errorf("%s: %w", qry, err))
+			b.Fatal(fmt.Errorf("%s: %w", qry, err))
 		}
 	}
 
@@ -126,7 +125,7 @@ END tst_bench_25;`,
 			dates, keys, ips, zones, plans, banners, referrers, countries, regions,
 		); err != nil {
 			if strings.Contains(err.Error(), "PLS-00905") || strings.Contains(err.Error(), "ORA-06508") {
-				b.Log(godror.GetCompileErrors(testDb, false))
+				b.Log(godror.GetCompileErrors(ctx, testDb, false))
 			}
 			//b.Log(dates, keys, ips, zones, plans, banners, referrers, countries, regions)
 			b.Fatal(err)
@@ -195,7 +194,7 @@ END tst_bench_inout;`,
 			if strings.HasPrefix(qry, "DROP TABLE ") {
 				continue
 			}
-			b.Fatal(errors.Errorf("%s: %w", qry, err))
+			b.Fatal(fmt.Errorf("%s: %w", qry, err))
 		}
 	}
 
@@ -250,7 +249,7 @@ END tst_bench_inout;`,
 	for i := 0; i < b.N; i += n {
 		if _, err := tx.ExecContext(ctx, qry, params...); err != nil {
 			if strings.Contains(err.Error(), "PLS-00905") || strings.Contains(err.Error(), "ORA-06508") {
-				b.Log(godror.GetCompileErrors(testDb, false))
+				b.Log(godror.GetCompileErrors(ctx, testDb, false))
 			}
 			//b.Log(dates, keys, ips, zones, plans, banners, referrers, countries, regions)
 			b.Fatal(err)
@@ -476,4 +475,19 @@ func benchSelect(b *testing.B, geoTableName string, prefetchLen int) {
 		b.SetBytes(readBytes / recNo)
 		rows.Close()
 	}
+}
+
+func BenchmarkSprintf(b *testing.B) {
+	ss := make([]string, 1024)
+	for i := int32(0); i < int32(b.N); i++ {
+		ss[i%1024] = fmt.Sprintf("%d-%d", i%42, 1+i%12)
+	}
+	b.Log(ss[0])
+}
+func BenchmarkStrconv(b *testing.B) {
+	ss := make([]string, 1024)
+	for i := int32(0); i < int32(b.N); i++ {
+		ss[i%1024] = strconv.Itoa(int(i%42)) + "-" + strconv.Itoa(int(1+i%12))
+	}
+	b.Log(ss[0])
 }

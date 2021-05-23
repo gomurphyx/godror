@@ -1,4 +1,4 @@
-// Copyright 2018 Kurt K, Tamás Gulácsi.
+// Copyright 2018, 2020 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -8,9 +8,8 @@ package godror_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
-
-	errors "golang.org/x/xerrors"
 
 	godror "github.com/godror/godror"
 )
@@ -27,18 +26,17 @@ func exampleStartup(startupMode godror.StartupMode) error {
 	dsn := "oracle://?sysdba=1&prelim=1"
 	db, err := sql.Open("godror", dsn)
 	if err != nil {
-		log.Fatal(errors.Errorf("%s: %w", dsn, err))
+		log.Fatal(fmt.Errorf("%s: %w", dsn, err))
 	}
 	defer db.Close()
 
-	oraDB, err := godror.DriverConn(ctx, db)
-	if err != nil {
-		return err
-	}
-	log.Println("Starting database")
-	if err = oraDB.Startup(startupMode); err != nil {
-		return err
-	}
+	err = godror.Raw(ctx, db, func(oraDB godror.Conn) error {
+		log.Println("Starting database")
+		if err = oraDB.Startup(startupMode); err != nil {
+			return err
+		}
+		return nil
+	})
 	// You cannot alter database on the prelim_auth connection.
 	// So open a new connection and complete startup, as Startup starts pmon.
 	db2, err := sql.Open("godror", "oracle://?sysdba=1")
@@ -63,7 +61,7 @@ func ExampleShutdownMode() {
 	dsn := "oracle://?sysdba=1" // equivalent to "/ as sysdba"
 	db, err := sql.Open("godror", dsn)
 	if err != nil {
-		log.Fatal(errors.Errorf("%s: %w", dsn, err))
+		log.Fatal(fmt.Errorf("%s: %w", dsn, err))
 	}
 	defer db.Close()
 
@@ -75,12 +73,11 @@ func ExampleShutdownMode() {
 func exampleShutdown(db *sql.DB, shutdownMode godror.ShutdownMode) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	oraDB, err := godror.DriverConn(ctx, db)
+	err := godror.Raw(ctx, db, func(oraDB godror.Conn) error {
+		log.Printf("Beginning shutdown %v", shutdownMode)
+		return oraDB.Shutdown(shutdownMode)
+	})
 	if err != nil {
-		return err
-	}
-	log.Printf("Beginning shutdown %v", shutdownMode)
-	if err = oraDB.Shutdown(shutdownMode); err != nil {
 		return err
 	}
 	// If we abort the shutdown process is over immediately.
@@ -97,8 +94,7 @@ func exampleShutdown(db *sql.DB, shutdownMode godror.ShutdownMode) error {
 		return err
 	}
 	log.Println("Finishing shutdown")
-	if err = oraDB.Shutdown(godror.ShutdownFinal); err != nil {
-		return err
-	}
-	return nil
+	return godror.Raw(ctx, db, func(oraDB godror.Conn) error {
+		return oraDB.Shutdown(godror.ShutdownFinal)
+	})
 }

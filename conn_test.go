@@ -1,4 +1,4 @@
-// Copyright 2017 Tamás Gulácsi
+// Copyright 2017, 2020 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -9,135 +9,56 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/google/go-cmp/cmp"
-	errors "golang.org/x/xerrors"
 )
 
-func TestParseConnString(t *testing.T) {
-	t.Parallel()
-	wantAt := ConnectionParams{
-		Username:       "cc",
-		Password:       "c@c*1",
-		SID:            "192.168.1.1/cc",
-		MaxLifeTime:    DefaultMaxLifeTime,
-		SessionTimeout: DefaultSessionTimeout,
-		WaitTimeout:    DefaultWaitTimeout,
-	}
-	wantDefault := ConnectionParams{
-		Username:       "user",
-		Password:       "pass",
-		SID:            "sid",
-		ConnClass:      DefaultConnectionClass,
-		MinSessions:    DefaultPoolMinSessions,
-		MaxSessions:    DefaultPoolMaxSessions,
-		PoolIncrement:  DefaultPoolIncrement,
-		MaxLifeTime:    DefaultMaxLifeTime,
-		SessionTimeout: DefaultSessionTimeout,
-		WaitTimeout:    DefaultWaitTimeout}
-
-	wantXO := wantDefault
-	wantXO.SID = "localhost/sid"
-
-	wantHeterogeneous := wantXO
-	wantHeterogeneous.HeterogeneousPool = true
-
-	setP := func(s, p string) string {
-		if i := strings.Index(s, ":SECRET-"); i >= 0 {
-			if j := strings.Index(s[i:], "@"); j >= 0 {
-				return s[:i+1] + p + s[i+j:]
-			}
-		}
-		return s
-	}
-
-	for tName, tCase := range map[string]struct {
-		In   string
-		Want ConnectionParams
-	}{
-		"simple": {In: "user/pass@sid", Want: wantDefault},
-		"full": {In: "oracle://user:pass@sid/?poolMinSessions=3&poolMaxSessions=9&poolIncrement=3&connectionClass=POOLED&sysoper=1&sysdba=0&poolWaitTimeout=200ms&poolSessionMaxLifetime=4000s&poolSessionTimeout=2000s",
-			Want: ConnectionParams{Username: "user", Password: "pass", SID: "sid",
-				ConnClass: "POOLED", IsSysOper: true,
-				MinSessions: 3, MaxSessions: 9, PoolIncrement: 3,
-				WaitTimeout: 200 * time.Millisecond, MaxLifeTime: 4000 * time.Second, SessionTimeout: 2000 * time.Second}},
-
-		"@": {
-			In:   setP(wantAt.String(), wantAt.Password),
-			Want: wantAt},
-
-		"xo":            {In: "oracle://user:pass@localhost/sid", Want: wantXO},
-		"heterogeneous": {In: "oracle://user:pass@localhost/sid?heterogeneousPool=1", Want: wantHeterogeneous},
-
-		"ipv6": {
-			In: "oracle://[::1]:12345/dbname",
-			Want: ConnectionParams{
-				SID:         "[::1]:12345/dbname",
-				ConnClass:   "GODROR",
-				MinSessions: 1, MaxSessions: 1000, PoolIncrement: 1,
-				WaitTimeout: 30 * time.Second, MaxLifeTime: 1 * time.Hour, SessionTimeout: 5 * time.Minute,
-			},
-		},
-
-		"onInit": {In: "oracle://user:pass@sid/?poolMinSessions=3&poolMaxSessions=9&poolIncrement=3&connectionClass=POOLED&sysoper=1&sysdba=0&poolWaitTimeout=200ms&poolSessionMaxLifetime=4000s&poolSessionTimeout=2000s&onInit=a&onInit=b",
-			Want: ConnectionParams{Username: "user", Password: "pass", SID: "sid",
-				ConnClass: "POOLED", IsSysOper: true,
-				MinSessions: 3, MaxSessions: 9, PoolIncrement: 3,
-				WaitTimeout: 200 * time.Millisecond, MaxLifeTime: 4000 * time.Second, SessionTimeout: 2000 * time.Second,
-				OnInit: []string{"a", "b"},
-			}},
-	} {
-		t.Log(tCase.In)
-		P, err := ParseConnString(tCase.In)
-		if err != nil {
-			t.Errorf("%s: %v", tName, err)
-			continue
-		}
-		if !reflect.DeepEqual(P, tCase.Want) {
-			t.Errorf("%s: parse of %q got %#v, wanted %#v\n%s", tName, tCase.In, P, tCase.Want, cmp.Diff(tCase.Want, P))
-			continue
-		}
-		s := setP(P.String(), P.Password)
-		Q, err := ParseConnString(s)
-		if err != nil {
-			t.Errorf("%s: parseConnString %v", tName, err)
-			continue
-		}
-		if !reflect.DeepEqual(P, Q) {
-			t.Errorf("%s: params got %+v, wanted %+v\n%s", tName, P, Q, cmp.Diff(P, Q))
-			continue
-		}
-		if got := setP(Q.String(), Q.Password); s != got {
-			t.Errorf("%s: paramString got %q, wanted %q", tName, got, s)
-		}
-	}
-}
-
 func TestMaybeBadConn(t *testing.T) {
+	t.Parallel()
 	want := driver.ErrBadConn
-	if got := maybeBadConn(errors.Errorf("bad: %w", want), nil); got != want {
+	if got := maybeBadConn(fmt.Errorf("bad: %w", want), nil); got != want {
 		t.Errorf("got %v, wanted %v", got, want)
 	}
 }
 
 func TestCalculateTZ(t *testing.T) {
+	t.Parallel()
+	const bdpstName = "Europe/Budapest"
+	bdpstZone, bdpstOff := "+01:00", int(3600)
+	bdpstLoc, err := time.LoadLocation(bdpstName)
+	if err != nil {
+		t.Log(err)
+	} else {
+		nowUTC := time.Now().UTC()
+		const format = "20060102T150405"
+		nowBdpst, err := time.ParseInLocation(format, nowUTC.Format(format), bdpstLoc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bdpstOff = int(nowUTC.Sub(nowBdpst) / time.Second)
+		secs := bdpstOff % 3600
+		if secs < 0 {
+			secs = -secs
+		}
+		bdpstZone = fmt.Sprintf("%+02d:%02d", bdpstOff/3600, secs)
+	}
+	const Hour = 3600
 	for _, tC := range []struct {
-		dbTZ, timezone string
-		off            int
-		err            error
+		err          error
+		dbTZ, dbOSTZ string
+		off          int
 	}{
-		{dbTZ: "Europe/Budapest", timezone: "+01:00", off: 3600},
-		{dbTZ: "+01:00", off: +3600},
-		{off: 1800, err: io.EOF},
-		{timezone: "+00:30", off: 1800},
+		{dbTZ: bdpstName, dbOSTZ: bdpstZone, off: bdpstOff},
+		{dbTZ: "+01:00", dbOSTZ: "", off: +Hour},
+		{dbTZ: "", dbOSTZ: "", off: 1800, err: io.EOF},
+		{dbTZ: "", dbOSTZ: "+00:30", off: +Hour / 2},
+		{dbTZ: "+02:00", dbOSTZ: "+02:00", off: +2 * Hour},
+		{dbTZ: "+00:00", dbOSTZ: "-07:00", off: -7 * Hour},
 	} {
-		prefix := fmt.Sprintf("%q/%q", tC.dbTZ, tC.timezone)
-		_, off, err := calculateTZ(tC.dbTZ, tC.timezone)
-		t.Log(prefix, off, err)
+		prefix := fmt.Sprintf("%q/%q", tC.dbTZ, tC.dbOSTZ)
+		_, off, err := calculateTZ(tC.dbTZ, tC.dbOSTZ, false)
+		t.Logf("tz=%s => off=%d error=%+v", prefix, off, err)
 		if (err == nil) != (tC.err == nil) {
 			t.Errorf("ERR %s: wanted %v, got %v", prefix, tC.err, err)
 		} else if err == nil && off != tC.off {
@@ -145,18 +66,55 @@ func TestCalculateTZ(t *testing.T) {
 		}
 	}
 }
-func TestParseTZ(t *testing.T) {
-	for k, v := range map[string]int{
-		"00:00": 0, "+00:00": 0, "-00:00": 0,
-		"01:00": 3600, "+01:00": 3600, "-01:01": -3660,
-		"+02:03": 7380,
-	} {
-		i, err := parseTZ(k)
+
+func TestTZName(t *testing.T) {
+	f := func(dbTZ string) (*time.Location, error) {
+		t.Log("try", dbTZ)
+		tz, err := time.LoadLocation(dbTZ)
 		if err != nil {
-			t.Fatal(errors.Errorf("%s: %w", k, err))
+			for _, nm := range tzNames {
+				if strings.EqualFold(nm, dbTZ) {
+					tz, err = time.LoadLocation(nm)
+					break
+				}
+			}
 		}
-		if i != v {
-			t.Errorf("%s. got %d, wanted %d.", k, i, v)
+		if err == nil {
+			if tz == nil {
+				tz = time.UTC
+			}
+			return tz, nil
+		}
+		return nil, err
+	}
+
+	chicago, err := time.LoadLocation("America/Chicago")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newYork, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for in, want := range map[string]struct {
+		*time.Location
+		error
+	}{
+		"UTC":              {time.UTC, nil},
+		"Europe/Berlin":    {berlin, nil},
+		"America/Chicago":  {chicago, nil},
+		"AMERICA/CHICAGO":  {chicago, nil},
+		"AMERICA/NeW_yORk": {newYork, nil},
+	} {
+		got, err := f(in)
+		if err != want.error {
+			t.Errorf("%q got error %+v, wanted %v", in, err, want.error)
+		} else if got != want.Location && got.String() != want.Location.String() {
+			t.Errorf("%q got %v, wanted %v", in, got, want.Location)
 		}
 	}
 }

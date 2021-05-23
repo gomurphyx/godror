@@ -52,7 +52,7 @@ static int dpiSodaDb__getCollectionNames(dpiSodaDb *db, void *cursorHandle,
 
         // get next collection from cursor
         if (dpiOci__sodaCollGetNext(db->conn, cursorHandle, &collectionHandle,
-                DPI_OCI_DEFAULT, error) < 0)
+                error) < 0)
             return DPI_FAILURE;
         if (!collectionHandle)
             break;
@@ -197,7 +197,7 @@ int dpiSodaDb_createCollection(dpiSodaDb *db, const char *name,
 //-----------------------------------------------------------------------------
 // dpiSodaDb_createDocument() [PUBLIC]
 //   Create a SODA document that can be inserted in the collection or can be
-// used to replace and existing document in the collection.
+// used to replace an existing document in the collection.
 //-----------------------------------------------------------------------------
 int dpiSodaDb_createDocument(dpiSodaDb *db, const char *key,
         uint32_t keyLength, const char *content, uint32_t contentLength,
